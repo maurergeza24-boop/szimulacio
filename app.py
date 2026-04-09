@@ -7,10 +7,10 @@ import glob
 import streamlit as st
 import numpy as np
 
-# --- 1. OLDAL KONFIGURÁCIÓ ÉS LETÖLTÉS (Változatlan) ---
-st.set_page_config(page_title="COVID-19 Összehasonlítás", layout="wide")
-st.title("Magyarországi COVID adatok vs. Szimulációs Átlag (Közös időszak)")
-st.markdown("A grafikon kizárólag a valós adatok időintervallumát mutatja be, összevetve azt a szimulációs csoport várható értékével.")
+# --- 1. OLDAL KONFIGURÁCIÓ ÉS ADATOK ---
+st.set_page_config(page_title="COVID-19 Forgatókönyvek", layout="wide")
+st.title("Magyarországi COVID adatok vs. Szimulációs Átlagok")
+st.markdown("A grafikon a valós adatok időszakában mutatja be a két különböző szimulációs csoport várható értékét.")
 
 URL_EXCEL = "https://users.itk.ppke.hu/~regiszo/korona_hun.xlsx"
 URL_ZIP = "https://users.itk.ppke.hu/~regiszo/covid_data.zip"
@@ -32,72 +32,70 @@ def prepare_files():
 
 prepare_files()
 
-# --- 2. MAGYAR ADATOK INTERPOLÁCIÓJA ÉS IDŐSÁV ---
+# --- 2. MAGYAR ADATOK ELŐKÉSZÍTÉSE ---
 df_hun = pd.read_excel(EXCEL_NAME)
 date_col = df_hun.columns[0]
 val_col = df_hun.columns[1]
 
 df_hun[date_col] = pd.to_datetime(df_hun[date_col])
-# Duplikációk kezelése az interpoláció előtt
 df_hun = df_hun.groupby(date_col).mean().sort_index()
 
-# Meghatározzuk a valós adatok idősávját
 start_date = df_hun.index.min()
 end_date = df_hun.index.max()
-st.info(f"A valós adatok idősávja: {start_date.date()} - {end_date.date()}")
 
-# Lyukak kitöltése a teljes időszakra
+# Interpolált valós adatsor
 full_range = pd.date_range(start=start_date, end=end_date, freq='D')
 df_hun_daily = df_hun.reindex(full_range)
 df_hun_daily['interpolated'] = df_hun_daily[val_col].interpolate(method='linear')
 
-# --- 3. SZIMULÁCIÓS ÁTLAG (series_1) ÉS IDŐZÍTÉS ---
-csv_files = glob.glob(f"{EXTRACT_DIR}/series_1_*.csv")
-all_runs_i = []
+# --- 3. SZIMULÁCIÓS ÁTLAGOK KISZÁMÍTÁSA ---
+csv_files = glob.glob(f"{EXTRACT_DIR}/*.csv")
 
-for file in csv_files:
-    # Beolvasás és numerikus típus kényszerítése
-    df_sim = pd.read_csv(file, header=None, names=COLUMN_NAMES)
-    all_runs_i.append(pd.to_numeric(df_sim['I'], errors='coerce'))
+def get_group_mean(pattern, start_dt, end_dt):
+    group_files = [f for f in csv_files if pattern in os.path.basename(f)]
+    if not group_files:
+        return None
+    
+    all_runs = []
+    for file in group_files:
+        df = pd.read_csv(file, header=None, names=COLUMN_NAMES)
+        all_runs.append(pd.to_numeric(df['I'], errors='coerce'))
+    
+    # Átlagolás
+    mean_series = pd.concat(all_runs, axis=1).mean(axis=1, numeric_only=True)
+    
+    # Időbeli illesztés és vágás
+    dates = pd.date_range(start=start_dt, periods=len(mean_series), freq='D')
+    mean_series.index = dates
+    return mean_series[start_dt:end_dt]
 
-# DataFrame-be gyűjtjük és kiszámoljuk az átlagot (várható értéket)
-df_series_1_all = pd.concat(all_runs_i, axis=1)
-mean_series_1 = df_series_1_all.mean(axis=1, numeric_only=True)
-
-# --- IDŐZÍTÉS ILLESZTÉSE A VALÓS ADATOKHOZ ---
-# A szimuláció 0. napját hozzárendeljük a valós adatok kezdőnapjához
-sim_dates = pd.date_range(start=start_date, periods=len(mean_series_1), freq='D')
-mean_series_1.index = sim_dates
-
-# Kizárólag a valós adatok idősávjára korlátozzuk a szimulációt
-mean_series_1_trimmed = mean_series_1[start_date:end_date]
+mean_1 = get_group_mean("series_1", start_date, end_date)
+mean_2 = get_group_mean("series_2", start_date, end_date)
 
 # --- 4. VIZUALIZÁCIÓ ---
 fig, ax = plt.subplots(figsize=(12, 6))
 
-# A) Valós grafikon (vastag fekete vonal és pontok)
+# Valós adatok
 ax.plot(df_hun_daily.index, df_hun_daily['interpolated'], 
         label='Valós adatok (interpolált)', color='black', linewidth=3, zorder=10)
-ax.scatter(df_hun.index, df_hun[val_col], color='gray', s=10, alpha=0.5, label='Eredeti mérések')
+ax.scatter(df_hun.index, df_hun[val_col], color='black', s=10, alpha=0.3)
 
-# B) Szimulált grafikon (színes vonal, csak a közös időszakban)
-if not mean_series_1_trimmed.empty:
-    ax.plot(mean_series_1_trimmed.index, mean_series_1_trimmed, 
-            label='Szimulált átlag (1. csoport, 10 futtatás)', color='#1f77b4', linewidth=2.5)
-else:
-    st.error("A szimulációs idővonal nem illeszkedik a valós adatok idősávjára.")
+# 1. csoport átlaga (Kék)
+if mean_1 is not None:
+    ax.plot(mean_1.index, mean_1, label='1. szimulációs csoport átlaga', color='#1f77b4', linewidth=2, linestyle='--')
 
-# Tengelybeállítások
-ax.set_title("COVID-19 Fertőzöttek: Valóság vs. Szimuláció (Közös Idősáv)", fontsize=14)
+# 2. csoport átlaga (Zöld)
+if mean_2 is not None:
+    ax.plot(mean_2.index, mean_2, label='2. szimulációs csoport átlaga', color='#2ca02c', linewidth=2, linestyle='--')
+
+ax.set_title("COVID-19 Fertőzöttek: Valóság vs. Két szimulációs forgatókönyv", fontsize=14)
 ax.set_ylabel("Fertőzöttek száma (I)")
 ax.set_xlabel("Dátum")
-# Biztosítjuk, hogy a tengely pontosan a valós adatok határait mutassa
-ax.set_xlim(start_date, end_date) 
+ax.set_xlim(start_date, end_date)
 ax.legend()
-ax.grid(True, linestyle='--', alpha=0.6)
+ax.grid(True, linestyle='--', alpha=0.5)
 
 st.pyplot(fig)
 
-# Opcionális: Statisztika
-if not mean_series_1_trimmed.empty:
-    st.info(f"A grafikon {len(csv_files)} darab 'series_1' típusú fájl átlagolásával és időbeli illesztésével készült.")
+# Információ a kijelzőn
+st.info(f"Időszak: {start_date.date()} - {end_date.date()}")
