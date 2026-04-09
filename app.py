@@ -1,99 +1,87 @@
-import streamlit as st
 import pandas as pd
-import numpy as np
+import matplotlib.pyplot as plt
+import requests
 import zipfile
-import plotly.graph_objects as go
+import os
+import glob
 
-st.set_page_config(page_title="Epidemiológiai Vizualizáció", layout="wide")
-st.title("Epidemiológiai Adatok Vizualizációja")
+# --- 1. KONFIGURÁCIÓ ÉS LETÖLTÉS ---
+URL_EXCEL = "https://users.itk.ppke.hu/~regiszo/korona_hun.xlsx"
+URL_ZIP = "https://users.itk.ppke.hu/~regiszo/covid_data.zip"
+EXCEL_NAME = "korona_hun.xlsx"
+ZIP_NAME = "covid_data.zip"
+EXTRACT_DIR = "covid_data"
 
-# 1. Google Sheets beolvasása
-SHEET_URL = "https://docs.google.com/spreadsheets/d/1e4VEZL1xvsALoOIq9V2SQuICeQrT5MtWfBm32ad7i8Q/export?format=csv&gid=311133316"
+def download_file(url, filename):
+    if not os.path.exists(filename):
+        print(f"Letöltés: {filename}...")
+        r = requests.get(url)
+        with open(filename, 'wb') as f:
+            f.write(r.content)
+    else:
+        print(f"{filename} már létezik, kihagyás.")
 
-@st.cache_data
-def load_real_data(url):
-    df = pd.read_csv(url)
-    for col in df.columns[1:]:
-        df[col] = pd.to_numeric(df[col], errors='coerce')
-    return df
+download_file(URL_EXCEL, EXCEL_NAME)
+download_file(URL_ZIP, ZIP_NAME)
 
-try:
-    df_real = load_real_data(SHEET_URL)
-    categories = df_real.columns.tolist()[1:] 
-    st.sidebar.success("✅ Google Sheet betöltve")
-except Exception as e:
-    st.error(f"Hiba a Google Sheet betöltésekor: {e}")
-    categories = []
+# --- 2. MAGYAR ADATOK FELDOLGOZÁSA ÉS INTERPOLÁCIÓ ---
+print("Magyar adatok feldolgozása...")
+df_hun = pd.read_excel(EXCEL_NAME)
 
-uploaded_file = st.sidebar.file_uploader("Töltsd fel a szimulációs .zip fájlt", type="zip")
-selected_category = st.selectbox("Válassz egy szempontot:", categories)
+# Dátum oszlop automatikus azonosítása és indexelése
+date_col = df_hun.columns[0]
+val_col = df_hun.columns[1]
+df_hun[date_col] = pd.to_datetime(df_hun[date_col])
+df_hun = df_hun.set_index(date_col).sort_index()
 
-if uploaded_file and selected_category:
-    sim_data_list = []
-    cat_lower = selected_category.lower() # Kisbetűs keresés a rugalmasságért
-    
-    try:
-        with zipfile.ZipFile(uploaded_file, 'r') as z:
-            csv_files = [f for f in z.namelist() if f.lower().endswith('.csv') and not f.startswith('__')][:10]
+# Folytonos idősor létrehozása (napi szinten)
+full_range = pd.date_range(start=df_hun.index.min(), end=df_hun.index.max(), freq='D')
+df_hun_daily = df_hun.reindex(full_range)
 
-            if not csv_files:
-                st.error("❌ Nem található .csv fájl a ZIP-ben!")
-            else:
-                for file in csv_files:
-                    with z.open(file) as f:
-                        df_sim = pd.read_csv(f, sep=None, engine='python')
-                        df_sim = df_sim.apply(pd.to_numeric, errors='coerce')
-                        
-                        # DINAMIKUS MAPPING (Kulcsszavak alapján)
-                        res = None
-                        try:
-                            if "kórház" in cat_lower or "ápolt" in cat_lower:
-                                res = df_sim['I5_h'] + df_sim['I6_h'] + df_sim['R_h']
-                            elif "új fertőzött" in cat_lower or "ni" in cat_lower:
-                                res = df_sim['NI']
-                            elif "aktív" in cat_lower:
-                                res = df_sim['E'] + df_sim['I1'] + df_sim['I2'] + df_sim['I3'] + df_sim['I4'] + df_sim['I5_h'] + df_sim['I6_h']
-                            elif "karantén" in cat_lower or "q" in cat_lower:
-                                res = df_sim['Q']
-                            elif selected_category in df_sim.columns:
-                                res = df_sim[selected_category]
-                            
-                            if res is not None:
-                                sim_data_list.append(res.reset_index(drop=True))
-                        except Exception as e:
-                            st.sidebar.error(f"Oszlop hiba a(z) {file} fájlban: {e}")
+# Lineáris interpoláció a lyukak kitöltésére
+df_hun_daily['interpolated'] = df_hun_daily[val_col].interpolate(method='linear')
 
-        if sim_data_list:
-            sim_matrix = pd.concat(sim_data_list, axis=1)
-            sim_mean = sim_matrix.mean(axis=1)
-            
-            # Szórás számítás
-            upper_dev = [sim_mean[i] + (sim_matrix.iloc[i][sim_matrix.iloc[i] > sim_mean[i]] - sim_mean[i]).mean() if not (sim_matrix.iloc[i][sim_matrix.iloc[i] > sim_mean[i]]).empty else sim_mean[i] for i in range(len(sim_mean))]
-            lower_dev = [sim_mean[i] - (sim_mean[i] - sim_matrix.iloc[i][sim_matrix.iloc[i] < sim_mean[i]]).mean() if not (sim_matrix.iloc[i][sim_matrix.iloc[i] < sim_mean[i]]).empty else sim_mean[i] for i in range(len(sim_mean))]
+# --- 3. SZIMULÁCIÓS ADATOK KICSOMAGOLÁSA ÉS BEOLVASÁSA ---
+if not os.path.exists(EXTRACT_DIR):
+    print("ZIP kicsomagolása...")
+    with zipfile.ZipFile(ZIP_NAME, 'r') as zip_ref:
+        zip_ref.extractall(".")
 
-            # --- GRAFIKON ---
-            fig = go.Figure()
-            x_axis = df_real.iloc[:, 0].reset_index(drop=True)
+csv_files = glob.glob(f"{EXTRACT_DIR}/*.csv")
+simulations = {}
 
-            # 1. Szimulációk
-            for i in range(sim_matrix.shape[1]):
-                fig.add_trace(go.Scatter(x=x_axis, y=sim_matrix.iloc[:, i], mode='lines', line=dict(color='rgba(150,150,150,0.15)', width=1), showlegend=False))
+for file in csv_files:
+    name = os.path.basename(file).replace('.csv', '')
+    simulations[name] = pd.read_csv(file)
 
-            # 2. Valós (Kék)
-            fig.add_trace(go.Scatter(x=x_axis, y=df_real[selected_category].reset_index(drop=True), mode='lines+markers', line=dict(color='#1f77b4', width=4), name='Valós értékek'))
+print(f"Beolvasva {len(simulations)} szimulációs fájl.")
 
-            # 3. Átlag (Piros)
-            fig.add_trace(go.Scatter(x=x_axis, y=sim_mean, mode='lines', line=dict(color='#d62728', width=3), name='Szimulált átlag'))
+# --- 4. VIZUALIZÁCIÓ ---
+plt.figure(figsize=(14, 7))
 
-            # 4. Szórások
-            fig.add_trace(go.Scatter(x=x_axis, y=upper_dev, mode='lines', line=dict(color='#2ca02c', width=2, dash='dot'), name='Felső szórás'))
-            fig.add_trace(go.Scatter(x=x_axis, y=lower_dev, mode='lines', line=dict(color='#ff7f0e', width=2, dash='dot'), name='Alsó szórás'))
+# Interpolált magyar görbe
+plt.plot(df_hun_daily.index, df_hun_daily['interpolated'], 
+         label='Magyar adatok (interpolált)', color='red', linewidth=2, zorder=5)
 
-            fig.update_layout(title=f"Analízis: {selected_category}", xaxis_title="Idő", yaxis_title="Fő", hovermode="x unified", height=650)
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.warning(f"Nem találtam a szimulációs fájlokban '{selected_category}' jellegű adatot. Ellenőrizd a CSV oszlopneveit!")
-    except Exception as e:
-        st.error(f"Váratlan hiba: {e}")
-else:
-    st.info("Töltsd fel a ZIP fájlt és válassz egy kategóriát!")
+# Eredeti adatpontok (ahol volt mérés)
+plt.scatter(df_hun.index, df_hun[val_col], 
+            label='Eredeti mérések', color='darkred', s=15, alpha=0.5, zorder=6)
+
+# Opcionális: Az első szimuláció kirajzolása összehasonlításképp
+# (Feltételezve, hogy a szimulációban is van 'day' és 'infected' jellegű oszlop)
+# first_sim = list(simulations.keys())[0]
+# plt.plot(simulations[first_sim].iloc[:,0], simulations[first_sim].iloc[:,1], 
+#          label=f'Szimuláció: {first_sim}', linestyle='--', alpha=0.7)
+
+plt.title('COVID-19 Fertőzöttek: Valós adatok interpolációval', fontsize=14)
+plt.xlabel('Dátum', fontsize=12)
+plt.ylabel('Fertőzöttek száma', fontsize=12)
+plt.legend()
+plt.grid(True, which='both', linestyle='--', alpha=0.5)
+plt.tight_layout()
+
+# Mentés GitHub-hoz vagy megjelenítés
+plt.savefig('covid_analysis_plot.png')
+plt.show()
+
+print("Kész! Az ábra elmentve 'covid_analysis_plot.png' néven.")
