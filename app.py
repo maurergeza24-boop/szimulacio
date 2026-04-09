@@ -12,6 +12,9 @@ EXCEL_NAME = "korona_hun.xlsx"
 ZIP_NAME = "covid_data.zip"
 EXTRACT_DIR = "covid_data"
 
+# Oszlopnevek a megadott dokumentáció alapján
+COLUMN_NAMES = ['S', 'E', 'I', 'R', 'D']
+
 def download_file(url, filename):
     if not os.path.exists(filename):
         print(f"Letöltés: {filename}...")
@@ -28,17 +31,13 @@ download_file(URL_ZIP, ZIP_NAME)
 print("Magyar adatok feldolgozása...")
 df_hun = pd.read_excel(EXCEL_NAME)
 
-# Dátum oszlop automatikus azonosítása és indexelése
 date_col = df_hun.columns[0]
 val_col = df_hun.columns[1]
 df_hun[date_col] = pd.to_datetime(df_hun[date_col])
 df_hun = df_hun.set_index(date_col).sort_index()
 
-# Folytonos idősor létrehozása (napi szinten)
 full_range = pd.date_range(start=df_hun.index.min(), end=df_hun.index.max(), freq='D')
 df_hun_daily = df_hun.reindex(full_range)
-
-# Lineáris interpoláció a lyukak kitöltésére
 df_hun_daily['interpolated'] = df_hun_daily[val_col].interpolate(method='linear')
 
 # --- 3. SZIMULÁCIÓS ADATOK KICSOMAGOLÁSA ÉS BEOLVASÁSA ---
@@ -52,36 +51,39 @@ simulations = {}
 
 for file in csv_files:
     name = os.path.basename(file).replace('.csv', '')
-    simulations[name] = pd.read_csv(file)
+    # Beolvasás a dokumentáció szerinti oszlopnevekkel
+    # Mivel a CSV-kben valószínűleg nincs fejléc, a 'names' paramétert használjuk
+    df_sim = pd.read_csv(file, header=None, names=COLUMN_NAMES)
+    simulations[name] = df_sim
 
-print(f"Beolvasva {len(simulations)} szimulációs fájl.")
+print(f"Beolvasva {len(simulations)} szimulációs fájl a megfelelő oszlopnevekkel (S, E, I, R, D).")
 
 # --- 4. VIZUALIZÁCIÓ ---
-plt.figure(figsize=(14, 7))
+plt.figure(figsize=(14, 8))
 
-# Interpolált magyar görbe
+# 1. Magyar adatok (Interpolált)
 plt.plot(df_hun_daily.index, df_hun_daily['interpolated'], 
-         label='Magyar adatok (interpolált)', color='red', linewidth=2, zorder=5)
+         label='Magyar valós adatok (interpolált)', color='black', linewidth=3, zorder=10)
 
-# Eredeti adatpontok (ahol volt mérés)
-plt.scatter(df_hun.index, df_hun[val_col], 
-            label='Eredeti mérések', color='darkred', s=15, alpha=0.5, zorder=6)
+# 2. Szimulációk ábrázolása (példaként az első 5-öt rajzoljuk ki, hogy átlátható maradjon)
+# A szimulációkban a napok számát (index) át kell váltani dátumra az összehasonlításhoz
+start_date = df_hun_daily.index.min()
 
-# Opcionális: Az első szimuláció kirajzolása összehasonlításképp
-# (Feltételezve, hogy a szimulációban is van 'day' és 'infected' jellegű oszlop)
-# first_sim = list(simulations.keys())[0]
-# plt.plot(simulations[first_sim].iloc[:,0], simulations[first_sim].iloc[:,1], 
-#          label=f'Szimuláció: {first_sim}', linestyle='--', alpha=0.7)
+for i, (name, df_sim) in enumerate(list(simulations.items())[:5]):
+    # Létrehozunk egy dátumindexet a szimulációnak is
+    sim_dates = pd.date_range(start=start_date, periods=len(df_sim), freq='D')
+    
+    # Az 'I' (Infected/Fertőzött) oszlopot rajzoljuk ki
+    plt.plot(sim_dates, df_sim['I'], label=f'Szimuláció: {name} (I)', alpha=0.6)
 
-plt.title('COVID-19 Fertőzöttek: Valós adatok interpolációval', fontsize=14)
+plt.title('Valós magyar COVID adatok vs. Szimulációs eredmények (I oszlop)', fontsize=14)
 plt.xlabel('Dátum', fontsize=12)
 plt.ylabel('Fertőzöttek száma', fontsize=12)
-plt.legend()
-plt.grid(True, which='both', linestyle='--', alpha=0.5)
+plt.legend(loc='upper left', bbox_to_anchor=(1, 1))
+plt.grid(True, linestyle='--', alpha=0.5)
 plt.tight_layout()
 
-# Mentés GitHub-hoz vagy megjelenítés
-plt.savefig('covid_analysis_plot.png')
+plt.savefig('covid_simulation_comparison.png')
 plt.show()
 
-print("Kész! Az ábra elmentve 'covid_analysis_plot.png' néven.")
+print("Kész! A szimulációkat az 'I' oszlop alapján ábrázoltuk.")
