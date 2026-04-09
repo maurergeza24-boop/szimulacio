@@ -5,119 +5,103 @@ import zipfile
 import os
 import glob
 import streamlit as st
-import numpy as np
 
-# --- 1. OLDAL KONFIGURÁCIÓ ---
-st.set_page_config(page_title="COVID-19 Modell Analízis", layout="wide")
-st.title("Magyarországi COVID adatok vs. Szimulációs Kumulatív Esetszám")
-st.markdown("""
-A grafikon a magyarországi összesített fertőzöttszámot veti össze két szimulációs forgatókönyv **kumulatív (C)** görbéjével.
-A szimulációk a valós adatok kezdőnapjához lettek igazítva.
-""")
+# --- 1. KONFIGURÁCIÓ ---
+st.set_page_config(page_title="COVID Szimuláció Analízis", layout="wide")
+st.title("Szimulációs eredmények vs. Valós adatok")
 
-# --- 2. ADATOK ELŐKÉSZÍTÉSE ---
 URL_EXCEL = "https://users.itk.ppke.hu/~regiszo/korona_hun.xlsx"
 URL_ZIP = "https://users.itk.ppke.hu/~regiszo/covid_data.zip"
 EXCEL_NAME = "korona_hun.xlsx"
 ZIP_NAME = "covid_data.zip"
 EXTRACT_DIR = "covid_data"
 
-# A README ALAPJÁN A PONTOS OSZLOPSORREND:
-# 1:S, 2:L, 3:I, 4:R, 5:D, 6:C (Cumulative), 7:V
-COLUMN_NAMES = ['S', 'L', 'I', 'R', 'D', 'C', 'V']
+# A megadott szempontok alapján összeállított oszlopsorrend (példa struktúra)
+# Megjegyzés: A pontos oszlopindexek a CSV-ben kulcsfontosságúak. 
+# Itt a leírásod szerinti sorrendet követjük.
+COLUMN_NAMES = [
+    'S', 'E', 'I1', 'I2', 'I3', 'I4', 'I5_h', 'I6_h', 'R_h', 'R', 'D1', 'NI', 
+    'T', 'P1', 'P2', 'Q', 'QT', 'NQ', 'MUT0', 'MUT1', 'MUT2', 'MUT3', 'MUT4', 'MUT5'
+]
 
 @st.cache_data
-def prepare_files():
+def load_data():
     for url, name in [(URL_EXCEL, EXCEL_NAME), (URL_ZIP, ZIP_NAME)]:
         if not os.path.exists(name):
             r = requests.get(url)
-            with open(name, 'wb') as f:
-                f.write(r.content)
+            with open(name, 'wb') as f: f.write(r.content)
     if not os.path.exists(EXTRACT_DIR):
-        with zipfile.ZipFile(ZIP_NAME, 'r') as zip_ref:
-            zip_ref.extractall(".")
+        with zipfile.ZipFile(ZIP_NAME, 'r') as z: z.extractall(".")
 
-prepare_files()
+load_data()
 
-# --- 3. MAGYAR ADATOK FELDOLGOZÁSA ---
+# --- 2. ADATFELDOLGOZÁS ---
+
+# Valós adatok beolvasása
 df_hun = pd.read_excel(EXCEL_NAME)
-date_col = df_hun.columns[0]
-val_col = df_hun.columns[1]
-
+date_col, val_col = df_hun.columns[0], df_hun.columns[1]
 df_hun[date_col] = pd.to_datetime(df_hun[date_col])
-# Duplikált dátumok kezelése (átlagolás)
 df_hun = df_hun.groupby(date_col).mean().sort_index()
 
+# Szimulációs adatok beolvasása (series_1 csoport)
+csv_files = glob.glob(f"{EXTRACT_DIR}/series_1_*.csv")
+all_sim_ni = []
+all_sim_active = []
+
+for f in csv_files:
+    # A 'low_memory=False' segít a sok oszlop kezelésében
+    df = pd.read_csv(f, header=None, names=COLUMN_NAMES, sep=',', index_col=False)
+    
+    # 1. Napi új fertőzöttek (NI)
+    all_sim_ni.append(pd.to_numeric(df['NI'], errors='coerce'))
+    
+    # 2. Aktív fertőzöttek (E + I1 + I2 + I3 + I4 + I5_h + I6_h)
+    active = df[['E', 'I1', 'I2', 'I3', 'I4', 'I5_h', 'I6_h']].sum(axis=1)
+    all_sim_active.append(active)
+
+# Átlagok kiszámítása
+sim_ni_mean = pd.concat(all_sim_ni, axis=1).mean(axis=1)
+sim_active_mean = pd.concat(all_sim_active, axis=1).mean(axis=1)
+
+# --- 3. IDŐSÁV ILLESZTÉSE (A szimuláció a mérvadó) ---
+# A szimuláció hossza határozza meg a grafikont
+sim_days = len(sim_ni_mean)
 start_date = df_hun.index.min()
-end_date = df_hun.index.max()
+# Létrehozzuk a szimulált napokhoz tartozó dátumokat
+sim_dates = pd.date_range(start=start_date, periods=sim_days, freq='D')
 
-# Interpolált valós adatsor a "lyukak" kitöltésére
-full_range = pd.date_range(start=start_date, end=end_date, freq='D')
-df_hun_daily = df_hun.reindex(full_range)
-df_hun_daily['interpolated'] = df_hun_daily[val_col].interpolate(method='linear')
+sim_ni_mean.index = sim_dates
+sim_active_mean.index = sim_dates
 
-# --- 4. SZIMULÁCIÓS CSOPORTOK FELDOLGOZÁSA (C oszlop alapján) ---
-csv_files = glob.glob(f"{EXTRACT_DIR}/*.csv")
+# A valós adatokat hozzávágjuk a szimulált időszakhoz
+df_hun_clipped = df_hun[df_hun.index <= sim_dates.max()]
+# Interpoláció a lyukakra a valós adaton belül
+full_range_clipped = pd.date_range(start=start_date, end=df_hun_clipped.index.max(), freq='D')
+df_hun_interp = df_hun_clipped.reindex(full_range_clipped).interpolate()
 
-def get_group_mean_cumulative(pattern, start_dt, end_dt):
-    group_files = [f for f in csv_files if pattern in os.path.basename(f)]
-    if not group_files:
-        return None
-    
-    all_runs_c = []
-    for file in group_files:
-        # 7 oszlop beolvasása a Readme szerint
-        df = pd.read_csv(file, header=None, names=COLUMN_NAMES)
-        # A 'C' (6. oszlop) az összesített esetszám, ezt hasonlítjuk a valósághoz
-        s_c = pd.to_numeric(df['C'], errors='coerce')
-        all_runs_c.append(s_c)
-    
-    # Csoportszintű átlag kiszámítása
-    mean_series = pd.concat(all_runs_c, axis=1).mean(axis=1, numeric_only=True)
-    
-    # Időbeli illesztés a valós adatok kezdetéhez
-    dates = pd.date_range(start=start_dt, periods=len(mean_series), freq='D')
-    mean_series.index = dates
-    
-    # Csak a valós adatok idősávjára vágjuk le
-    return mean_series[start_dt:end_dt]
+# --- 4. VIZUALIZÁCIÓ ---
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
 
-# Statisztikák kiszámítása mindkét csoportra
-mean_c1 = get_group_mean_cumulative("series_1", start_date, end_date)
-mean_c2 = get_group_mean_cumulative("series_2", start_date, end_date)
+# Felső grafikon: Napi új fertőzöttek (NI)
+ax1.plot(sim_ni_mean.index, sim_ni_mean, label="Szimulált Napi Új (NI átlag)", color='blue', linewidth=2)
+# Megjegyzés: A valós adatot akkor tegyük rá, ha az Excelben is napi új adat van (nem kumulatív)
+# Ha az Excel kumulatív, akkor a .diff() függvénnyel kapjuk meg a napi újat
+valos_napi = df_hun_interp[val_col].diff().fillna(0)
+ax1.bar(df_hun_interp.index, valos_napi, label="Valós Napi Új (Mért)", color='gray', alpha=0.3)
+ax1.set_title("Napi új fertőzöttek alakulása")
+ax1.legend()
 
-# --- 5. VIZUALIZÁCIÓ ---
-fig, ax = plt.subplots(figsize=(12, 7))
+# Alsó grafikon: Aktív fertőzöttek
+ax2.plot(sim_active_mean.index, sim_active_mean, label="Szimulált Aktív (E+I1..I6)", color='red', linewidth=2)
+ax2.set_title("Aktív fertőzöttek száma (Szimuláció)")
+ax2.set_xlabel("Dátum")
+ax2.legend()
 
-# VALÓS ADAT: Fekete vonal
-ax.plot(df_hun_daily.index, df_hun_daily['interpolated'], 
-        label='Valós magyar adatok (Kumulatív)', color='black', linewidth=3, zorder=10)
-ax.scatter(df_hun.index, df_hun[val_col], color='black', s=12, alpha=0.3, label='Mért pontok')
-
-# SZIMULÁCIÓ 1 (C oszlop átlaga): Kék
-if mean_c1 is not None:
-    ax.plot(mean_c1.index, mean_c1, label='Szimuláció 1 (C átlag)', color='#1f77b4', linewidth=2, linestyle='--')
-
-# SZIMULÁCIÓ 2 (C oszlop átlaga): Zöld
-if mean_c2 is not None:
-    ax.plot(mean_c2.index, mean_c2, label='Szimuláció 2 (C átlag)', color='#2ca02c', linewidth=2, linestyle='--')
-
-# Grafikon finomhangolása
-ax.set_title("Összesített fertőzöttek száma: Valóság vs. Modell (C oszlop)", fontsize=16)
-ax.set_ylabel("Összes regisztrált fertőzött")
-ax.set_xlabel("Dátum")
-ax.set_xlim(start_date, end_date) # Pontosan a valós időszakra korlátozzuk a nézetet
-ax.grid(True, which='both', linestyle='--', alpha=0.5)
-ax.legend(fontsize=11)
-
-# Streamlit megjelenítés
+plt.tight_layout()
 st.pyplot(fig)
 
-# Adat-statisztika megjelenítése
-st.info(f"Időszak: {start_date.date()} és {end_date.date()} között.")
-with st.expander("Segítség az értelmezéshez"):
-    st.write("""
-    - **Fekete vonal:** A magyar statisztikákból származó, napi szintre interpolált összesített esetszám.
-    - **Szaggatott vonalak:** A szimulációs fájlok 6. oszlopának ('C' - Cumulative Infectious) 10-10 futtatásból számolt átlaga.
-    - A szimulációk kezdőpontja (0. nap) a magyar adatok első napjához lett igazítva.
-    """)
+# --- 5. STATISZTIKA ---
+total_pop = 9700000 # Becsült magyar lakosság, ha a modell nem adja meg
+cum_sim = sim_ni_mean.sum()
+inf_rate = (cum_sim / total_pop) * 100
+st.metric("Szimulált átfertőzöttség", f"{inf_rate:.2f}%")
