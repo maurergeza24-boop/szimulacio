@@ -1,0 +1,2 @@
+# szimulacio
+covid adatok szimulációja
